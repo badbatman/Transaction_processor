@@ -1,0 +1,49 @@
+# Sensitive files - DO NOT COMMIT
+credentials.json
+*.key
+*.pem
+.env
+google-sheets.properties.local
+
+# Logs
+logs/
+*.log
+
+# Build artifacts
+target/
+build/
+*.jar
+*.class
+
+# IDE
+.idea/
+.vscode/
+*.iml
+.project
+.classpath
+.settings/
+
+# OS files
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Temporary files
+tmp/
+temp/
+*.tmp
+*.swp
+*.swo
+*~
+
+# Test artifacts
+test-output/
+surefire-reports/
+Transaction records(Alpha)_202601.csv
+Transaction records(Cash Flow)_202601.csv
+Requirement.md
+google-sheets.properties
+.roo/rules-architect/AGENTS.md
+.roo/rules-ask/AGENTS.md
+.roo/rules-code/AGENTS.md
+.roo/rules-debug/AGENTS.md
