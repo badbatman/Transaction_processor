@@ -3,8 +3,10 @@ package com.transactionprocessor.service;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
+import java.io.ByteArrayInputStream;
 import java.io.IOException;
 import java.math.BigDecimal;
+import java.nio.charset.Charset;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.LocalDate;
@@ -15,7 +17,6 @@ import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
-import com.transactionprocessor.config.ApplicationConfig;
 import com.transactionprocessor.model.Transaction;
 import com.transactionprocessor.model.TransactionType;
 
@@ -25,15 +26,13 @@ import com.transactionprocessor.model.TransactionType;
 class CsvParserServiceTest {
 
     private CsvParserService csvParserService;
-    private ApplicationConfig config;
 
     @TempDir
     Path tempDir;
 
     @BeforeEach
     void setUp() {
-        config = new ApplicationConfig();
-        csvParserService = new CsvParserService(config);
+        csvParserService = new CsvParserService();
     }
 
     @Test
@@ -73,6 +72,27 @@ class CsvParserServiceTest {
         assertThat(dividendTransaction.getType()).isEqualTo(TransactionType.DIVIDEND);
         assertThat(dividendTransaction.getPrice()).isEqualTo("0.00");
         assertThat(dividendTransaction.getDescription()).contains("每10股股息5.0");
+    }
+
+    @Test
+    void testParseGb18030CsvFile() throws IOException {
+        Path csvFile = tempDir.resolve("TR_202610.csv");
+        String csvContent = "雪球持仓组合：资产信息\n"
+            + "交易记录\n"
+            + "名称,代码,类型,日期,成交价,数量,金额,说明,备注\n"
+            + "科创50ETF华夏,SH588000,买入,2026/09/03,1.70,10000.0,16990.00,,\n";
+        byte[] gb18030Content = csvContent.getBytes(Charset.forName("GB18030"));
+        Files.write(csvFile, gb18030Content);
+
+        List<Transaction> transactions = csvParserService.parseCsvFile(csvFile);
+        List<Transaction> streamTransactions = csvParserService.parseCsvFile(
+            new ByteArrayInputStream(gb18030Content));
+
+        assertThat(transactions).hasSize(1);
+        assertThat(transactions.get(0).getName()).isEqualTo("科创50ETF华夏");
+        assertThat(transactions.get(0).getType()).isEqualTo(TransactionType.BUY);
+        assertThat(streamTransactions).hasSize(1);
+        assertThat(streamTransactions.get(0).getName()).isEqualTo("科创50ETF华夏");
     }
 
     @Test
@@ -137,6 +157,46 @@ class CsvParserServiceTest {
         BigDecimal fee = transaction.calculateFee();
 
         assertThat(fee).isEqualByComparingTo("5.00");
+    }
+
+    @Test
+    void testCalculateFeeFromDescriptionWhenFeeIsSplitAcrossText() {
+        Transaction transaction = new Transaction();
+        transaction.setDescription("卖出手续费 fee=1.71");
+        transaction.setRemarks("交易说明");
+
+        assertThat(transaction.calculateFee()).isEqualByComparingTo("1.71");
+
+        transaction.setDescription("Sell Call OCTfee=9.23Sell Call OCT");
+        transaction.setRemarks("");
+        assertThat(transaction.calculateFee()).isEqualByComparingTo("9.23");
+    }
+
+    @Test
+    void testParseStandaloneFeeContinuationIntoPreviousTransaction() throws IOException {
+        Path csvFile = tempDir.resolve("fee_continuation.csv");
+        Files.writeString(csvFile, "交易记录\n"
+            + "名称,代码,类型,日期,成交价,数量,金额,说明,备注\n"
+            + "股票A,AAA,除权除息,2025/12/24,0,0,15.41,每10股股息3.42,\n"
+            + "fee=1.71\n");
+
+        List<Transaction> transactions = csvParserService.parseCsvFile(csvFile);
+
+        assertThat(transactions).hasSize(1);
+        assertThat(transactions.get(0).calculateFee()).isEqualByComparingTo("1.71");
+    }
+
+    @Test
+    void testDeriveDividendAmountFromPerTenSharesDescription() throws IOException {
+        Path csvFile = tempDir.resolve("derived_dividend_amount.csv");
+        Files.writeString(csvFile, "交易记录\n"
+            + "名称,代码,类型,日期,成交价,数量,金额,说明,备注\n"
+            + "股票A,AAA,除权除息,2025/12/24,0,100,,每10股股息5.0,\n");
+
+        List<Transaction> transactions = csvParserService.parseCsvFile(csvFile);
+
+        assertThat(transactions).hasSize(1);
+        assertThat(transactions.get(0).getAmount()).isEqualByComparingTo("50");
     }
 
     @Test

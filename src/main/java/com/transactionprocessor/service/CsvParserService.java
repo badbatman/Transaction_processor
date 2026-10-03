@@ -1,12 +1,16 @@
 package com.transactionprocessor.service;
 
 import java.io.BufferedReader;
+import java.io.ByteArrayInputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.InputStreamReader;
 import java.io.Reader;
 import java.math.BigDecimal;
+import java.nio.charset.Charset;
+import java.nio.charset.IllegalCharsetNameException;
 import java.nio.charset.StandardCharsets;
+import java.nio.charset.UnsupportedCharsetException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Instant;
@@ -19,10 +23,10 @@ import java.util.List;
 
 import org.apache.commons.csv.CSVFormat;
 import org.apache.commons.csv.CSVRecord;
+import org.mozilla.universalchardet.UniversalDetector;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import com.transactionprocessor.config.ApplicationConfig;
 import com.transactionprocessor.model.Transaction;
 import com.transactionprocessor.model.TransactionType;
 
@@ -32,11 +36,9 @@ import com.transactionprocessor.model.TransactionType;
 public class CsvParserService {
     private static final Logger logger = LoggerFactory.getLogger(CsvParserService.class);
     
-    private final ApplicationConfig config;
     private final List<DateTimeFormatter> dateFormatters;
 
-    public CsvParserService(ApplicationConfig config) {
-        this.config = config;
+    public CsvParserService() {
         this.dateFormatters = createDateFormatters();
     }
 
@@ -50,7 +52,11 @@ public class CsvParserService {
             throw new IOException("CSV file not found: " + csvFilePath);
         }
 
-        try (Reader reader = Files.newBufferedReader(csvFilePath, StandardCharsets.UTF_8)) {
+        byte[] content = Files.readAllBytes(csvFilePath);
+        Charset charset = detectCharset(content);
+        logger.info("Detected CSV charset {} for {}", charset.name(), csvFilePath);
+
+        try (Reader reader = toUtf8Reader(content, charset)) {
             return parseCsvFromReader(reader, csvFilePath.toString());
         }
     }
@@ -61,8 +67,37 @@ public class CsvParserService {
     public List<Transaction> parseCsvFile(InputStream inputStream) throws IOException {
         logger.info("Parsing CSV from input stream");
         
-        try (Reader reader = new InputStreamReader(inputStream, StandardCharsets.UTF_8)) {
+        byte[] content;
+        try (inputStream) {
+            content = inputStream.readAllBytes();
+        }
+        Charset charset = detectCharset(content);
+        logger.info("Detected CSV charset {} for input stream", charset.name());
+
+        try (Reader reader = toUtf8Reader(content, charset)) {
             return parseCsvFromReader(reader, "classpath resource");
+        }
+    }
+
+    private Reader toUtf8Reader(byte[] content, Charset sourceCharset) {
+        byte[] utf8Content = new String(content, sourceCharset).getBytes(StandardCharsets.UTF_8);
+        return new InputStreamReader(new ByteArrayInputStream(utf8Content), StandardCharsets.UTF_8);
+    }
+
+    private Charset detectCharset(byte[] content) throws IOException {
+        UniversalDetector detector = new UniversalDetector(null);
+        detector.handleData(content, 0, content.length);
+        detector.dataEnd();
+        String detectedName = detector.getDetectedCharset();
+        detector.reset();
+
+        if (detectedName == null || detectedName.isBlank()) {
+            return StandardCharsets.UTF_8;
+        }
+        try {
+            return Charset.forName(detectedName);
+        } catch (IllegalCharsetNameException | UnsupportedCharsetException e) {
+            throw new IOException("Unsupported detected CSV charset: " + detectedName, e);
         }
     }
 
@@ -114,7 +149,11 @@ public class CsvParserService {
      */
     private List<Transaction> parseTransactionSection(Reader reader, String sourceName) throws IOException {
         // Use Apache Commons CSV to properly parse CSV with quoted fields
-        Iterable<CSVRecord> csvRecords = CSVFormat.DEFAULT.withFirstRecordAsHeader().parse(reader);
+        Iterable<CSVRecord> csvRecords = CSVFormat.DEFAULT.builder()
+            .setHeader()
+            .setSkipHeaderRecord(true)
+            .build()
+            .parse(reader);
             
         List<Transaction> transactions = new ArrayList<>();
         int lineNumber = 1; // Start after header
@@ -135,6 +174,13 @@ public class CsvParserService {
                         transactions.add(transaction);
                         logger.info("Successfully parsed transaction {}: {} ({})", transactions.size(), transaction.getName(), transaction.getType());
                     }
+                } else if (values.length == 1 && values[0].trim().matches("(?i)fee\\s*=.*")
+                        && !transactions.isEmpty()) {
+                    Transaction previousTransaction = transactions.get(transactions.size() - 1);
+                    String remarks = previousTransaction.getRemarks();
+                    previousTransaction.setRemarks((remarks == null || remarks.isBlank())
+                        ? values[0].trim()
+                        : remarks + " " + values[0].trim());
                 } else {
                     logger.debug("Skipping line {} with insufficient fields ({}): {}", lineNumber + 1, values.length, java.util.Arrays.toString(values));
                 }
@@ -223,6 +269,10 @@ public class CsvParserService {
             
             // Parse amount
             BigDecimal amount = parseDecimal(amountStr);
+            if (amount == null && transaction.getType() == TransactionType.DIVIDEND && quantity.signum() > 0
+                    && fields.length > 7) {
+                amount = deriveDividendAmount(fields[7], quantity);
+            }
             if (amount == null) {
                 logger.warn("Invalid amount '{}' at line {}, skipping record", amountStr, lineNumber);
                 return null;
@@ -240,6 +290,13 @@ public class CsvParserService {
                 transaction.setRemarks(fields[8].trim());
                 logger.debug("Parsed remarks: {}", fields[8].trim());
             }
+
+            StringBuilder rawRecord = new StringBuilder();
+            try (org.apache.commons.csv.CSVPrinter printer = new org.apache.commons.csv.CSVPrinter(
+                    rawRecord, CSVFormat.DEFAULT)) {
+                printer.printRecord((Object[]) fields);
+            }
+            transaction.setRawLine(rawRecord.toString().stripTrailing());
             
             logger.debug("Successfully parsed transaction: {}", transaction);
             return transaction;
@@ -253,106 +310,6 @@ public class CsvParserService {
     /**
      * Parse a single CSV record into a Transaction object
      */
-    private Transaction parseTransaction(CSVRecord record, int lineNumber) {
-        try {
-            logger.debug("Attempting to parse transaction at line {}: {}", lineNumber, record.toString());
-            
-            // Validate required fields
-            if (!hasRequiredFields(record)) {
-                logger.debug("Missing required fields at line {}, skipping record", lineNumber);
-                return null;
-            }
-
-            Transaction transaction = new Transaction();
-            transaction.setLineNumber(lineNumber);
-            
-            // Parse basic fields
-            transaction.setName(record.get("名称").trim());
-            transaction.setCode(record.get("代码").trim());
-            
-            // Parse transaction type
-            String typeStr = record.get("类型").trim();
-            try {
-                TransactionType type = TransactionType.fromString(typeStr);
-                transaction.setType(type);
-            } catch (IllegalArgumentException e) {
-                logger.warn("Unknown transaction type '{}' at line {}, skipping record", typeStr, lineNumber);
-                return null;
-            }
-            
-            // Parse date
-            String dateStr = record.get("日期").trim();
-            LocalDate date = parseDate(dateStr);
-            if (date == null) {
-                logger.warn("Invalid date format '{}' at line {}, skipping record", dateStr, lineNumber);
-                return null;
-            }
-            transaction.setDate(date);
-            
-            // Parse price
-            String priceStr = record.get("成交价").trim();
-            BigDecimal price = parseDecimal(priceStr);
-            transaction.setPrice(price);
-            
-            // Parse quantity
-            String quantityStr = record.get("数量").trim();
-            BigDecimal quantity = parseDecimal(quantityStr);
-            transaction.setQuantity(quantity);
-            
-            // Parse amount
-            String amountStr = record.get("金额").trim();
-            BigDecimal amount = parseDecimal(amountStr);
-            transaction.setAmount(amount);
-            
-            // Parse optional fields
-            if (record.isMapped("说明")) {
-                transaction.setDescription(record.get("说明").trim());
-            }
-            
-            if (record.isMapped("备注")) {
-                transaction.setRemarks(record.get("备注").trim());
-            }
-            
-            // Store raw line for error reporting
-            transaction.setRawLine(record.toString());
-            
-            logger.debug("Parsed transaction: {}", transaction);
-            return transaction;
-            
-        } catch (Exception e) {
-            logger.error("Error parsing transaction record at line {}: {}", lineNumber, e.getMessage(), e);
-            return null;
-        }
-    }
-
-    /**
-     * Check if the record has all required fields
-     */
-    private boolean hasRequiredFields(CSVRecord record) {
-        //名称,代码,类型,日期,成交价,数量,金额,说明,备注
-        String[] requiredHeaders = {"名称", "代码", "类型", "日期", "成交价", "数量", "金额"};
-        
-        logger.debug("Checking required fields for record: {}", java.util.Arrays.toString(record.values()));
-        
-        for (String header : requiredHeaders) {
-            try {
-                String value = record.get(header);
-                logger.debug("Field '{}' has value: '{}' (empty: {})", header, value, (value == null || value.trim().isEmpty()));
-                if (value == null || value.trim().isEmpty()) {
-                    logger.debug("Required field '{}' is missing or empty", header);
-                    return false;
-                }
-            } catch (IllegalArgumentException e) {
-                // Header not found in record
-                logger.debug("Required header '{}' not found in record", header);
-                return false;
-            }
-        }
-        
-        logger.debug("All required fields present");
-        return true;
-    }
-
     /**
      * Parse date from various input types (String, Double, Long)
      * Distinguishes between dates (numeric) and plain numbers (like years)
@@ -500,29 +457,27 @@ public class CsvParserService {
         }
     }
 
-    /**
-     * Create date formatters from configuration
-     */
+    private BigDecimal deriveDividendAmount(String description, BigDecimal quantity) {
+        if (description == null || description.isBlank()) {
+            return null;
+        }
+        java.util.regex.Matcher matcher = java.util.regex.Pattern
+            .compile("每10股股息\\s*([0-9]+(?:\\.[0-9]+)?)")
+            .matcher(description);
+        if (!matcher.find()) {
+            return null;
+        }
+        return new BigDecimal(matcher.group(1)).multiply(quantity)
+            .divide(BigDecimal.TEN, 12, java.math.RoundingMode.HALF_UP).stripTrailingZeros();
+    }
+
+    /** Create the supported input date formats. */
     private List<DateTimeFormatter> createDateFormatters() {
-        List<DateTimeFormatter> formatters = new ArrayList<>();
-        
-        for (String pattern : config.getCsvDateFormats()) {
-            try {
-                formatters.add(DateTimeFormatter.ofPattern(pattern.trim()));
-            } catch (Exception e) {
-                logger.warn("Invalid date format pattern: {}", pattern);
-            }
-        }
-        
-        // Add default formatters if none configured
-        if (formatters.isEmpty()) {
-            formatters.add(DateTimeFormatter.ofPattern("yyyy/M/d"));
-            formatters.add(DateTimeFormatter.ofPattern("yyyy-MM-dd"));
-            formatters.add(DateTimeFormatter.ofPattern("yyyy/MM/dd"));
-            formatters.add(DateTimeFormatter.ofPattern("yyyy-M-d"));
-        }
-        
-        return formatters;
+        return List.of(
+            DateTimeFormatter.ofPattern("yyyy/M/d"),
+            DateTimeFormatter.ofPattern("yyyy-M-d"),
+            DateTimeFormatter.ofPattern("yyyy/MM/dd"),
+            DateTimeFormatter.ofPattern("yyyy-MM-dd"));
     }
 
     /**

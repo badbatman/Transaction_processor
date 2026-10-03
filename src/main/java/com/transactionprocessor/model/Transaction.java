@@ -3,8 +3,8 @@ package com.transactionprocessor.model;
 import java.math.BigDecimal;
 import java.time.LocalDate;
 import java.util.Objects;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 /**
  * Represents a single transaction record from CSV file
@@ -77,25 +77,32 @@ public class Transaction {
      * Format: fee=123.45 in the remarks field
      */
     public BigDecimal getFeeFromRemarks() {
-        if (remarks == null || remarks.trim().isEmpty()) {
+        String feeText = joinFeeCandidateText();
+        if (feeText == null || feeText.trim().isEmpty()) {
             return BigDecimal.ZERO;
         }
-        
-        // Extract fee from remarks using regex pattern: fee=^\d+(?:\.\d+)?$
-        String[] parts = remarks.trim().split("\\s+");
-        for (String part : parts) {
-            if (part.toLowerCase().startsWith("fee=")) {
-                try {
-                    String feeValue = part.substring(4).trim();
-                    return new BigDecimal(feeValue);
-                } catch (NumberFormatException e) {
-                    // Silently return zero on parse error
-                    return BigDecimal.ZERO;
-                }
+
+        Matcher matcher = Pattern.compile("(?i)fee\\s*=\\s*([+-]?\\d+(?:\\.\\d+)?)").matcher(feeText);
+        if (matcher.find()) {
+            try {
+                return new BigDecimal(matcher.group(1));
+            } catch (NumberFormatException e) {
+                return BigDecimal.ZERO;
             }
         }
-        
+
         return BigDecimal.ZERO;
+    }
+
+    private String joinFeeCandidateText() {
+        StringBuilder sb = new StringBuilder();
+        if (description != null && !description.trim().isEmpty()) {
+            sb.append(description).append(' ');
+        }
+        if (remarks != null && !remarks.trim().isEmpty()) {
+            sb.append(remarks);
+        }
+        return sb.toString().trim();
     }
     
     /**
